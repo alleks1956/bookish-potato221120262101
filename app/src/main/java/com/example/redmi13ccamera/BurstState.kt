@@ -12,8 +12,9 @@ data class BurstState(
     val shotsTaken: Int = 0,
     val shotsFailed: Int = 0,
     val totalShots: Int = 0,          // 0 = бесконечно
-    val phase: String = "",           // "Старт через" / "Следующий кадр через"
+    val phase: String = "",           // "До старта" / "Следующий кадр через"
     val resolution: String = "",
+    val controls: String = "",        // применённые EV и зум
     val status: String = "Готово к съёмке"
 )
 
