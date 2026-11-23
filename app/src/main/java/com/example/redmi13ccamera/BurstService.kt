@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -35,40 +36,48 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.coroutines.resume
+import kotlin.math.roundToInt
 
 /**
  * Фоновая серия с таймером.
  *
  * Foreground service (тип camera) + PARTIAL_WAKE_LOCK: съёмка продолжается
  * при выключенном экране и после сворачивания приложения.
- * Без Preview: меньше нагрузка на ОЗУ и GPU Helio G85.
- * Разрешение: только биннинг 12,5 МП (4080x3060). 50 МП отсекается фильтром.
+ * Только 12,5 МП (биннинг). Есть компенсация экспозиции, цифровой зум 2×
+ * и таймер: время старта и время остановки (по часам).
  */
 class BurstService : LifecycleService() {
 
     companion object {
         const val ACTION_START = "com.example.redmi13ccamera.START"
         const val ACTION_STOP = "com.example.redmi13ccamera.STOP"
+        const val ACTION_UPDATE = "com.example.redmi13ccamera.UPDATE"
         const val EXTRA_TOTAL = "total"
         const val EXTRA_INTERVAL = "interval"
         const val EXTRA_DELAY = "delay"
+        const val EXTRA_EV = "ev"             // Float, в стопах EV
+        const val EXTRA_ZOOM = "zoom"         // Float, 1.0 или 2.0
+        const val EXTRA_START_AT = "start_at" // epoch ms, 0 = сразу
+        const val EXTRA_STOP_AT = "stop_at"   // epoch ms, 0 = нет
 
         private const val TAG = "Redmi13CBurst"
         private const val CHANNEL_ID = "burst_channel"
         private const val NOTIFICATION_ID = 1301
 
-        // Биннинг 4-в-1: 50 МП -> 12,5 МП
-        private val TARGET_SIZE = Size(4080, 3060)
-        private const val MAX_PIXELS = 13_000_000L   // всё, что больше, не используем
+        private val TARGET_SIZE = Size(4080, 3060)   // биннинг 4-в-1
+        private const val MAX_PIXELS = 13_000_000L
         private const val JPEG_QUALITY = 90
         private const val MAX_FAIL_STREAK = 5
-        private const val WAKELOCK_TIMEOUT_MS = 12 * 60 * 60 * 1000L
+        private const val WAKELOCK_TIMEOUT_MS = 24 * 60 * 60 * 1000L
         private const val SAVE_DIR = "Pictures/Redmi13CCamera"
     }
 
     private var burstJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var desiredEv = 0f
+    private var desiredZoom = 1f
 
     override fun onCreate() {
         super.onCreate()
@@ -82,18 +91,29 @@ class BurstService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_START -> {
-                // Обязательно сразу: после startForegroundService есть всего 5 секунд
                 ServiceCompat.startForeground(
-                    this, NOTIFICATION_ID, buildNotification("Подготовка камеры…"),
+                    this, NOTIFICATION_ID, buildNotification("Подготовка…"),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
                 )
                 if (burstJob?.isActive != true) {
+                    desiredEv = intent.getFloatExtra(EXTRA_EV, 0f)
+                    desiredZoom = intent.getFloatExtra(EXTRA_ZOOM, 1f)
                     startBurst(
                         total = intent.getIntExtra(EXTRA_TOTAL, 10),
                         intervalSec = intent.getIntExtra(EXTRA_INTERVAL, 2).coerceAtLeast(1),
-                        delaySec = intent.getIntExtra(EXTRA_DELAY, 3).coerceAtLeast(0)
+                        delaySec = intent.getIntExtra(EXTRA_DELAY, 3).coerceAtLeast(0),
+                        startAt = intent.getLongExtra(EXTRA_START_AT, 0L),
+                        stopAt = intent.getLongExtra(EXTRA_STOP_AT, 0L)
                     )
                 }
+            }
+            ACTION_UPDATE -> {
+                // Изменение EV/зума на лету во время серии
+                if (burstJob?.isActive == true) {
+                    desiredEv = intent.getFloatExtra(EXTRA_EV, desiredEv)
+                    desiredZoom = intent.getFloatExtra(EXTRA_ZOOM, desiredZoom)
+                    camera?.let { applyControls(it) }
+                } else stopSelf()
             }
             ACTION_STOP -> {
                 val job = burstJob
@@ -104,16 +124,16 @@ class BurstService : LifecycleService() {
         return START_NOT_STICKY
     }
 
-    private fun startBurst(total: Int, intervalSec: Int, delaySec: Int) {
+    private fun startBurst(total: Int, intervalSec: Int, delaySec: Int, startAt: Long, stopAt: Long) {
         acquireWakeLock()
         BurstStateHolder.update {
-            BurstState(isRunning = true, totalShots = total, status = "Подготовка камеры…")
+            BurstState(isRunning = true, totalShots = total, status = "Подготовка…")
         }
 
         burstJob = lifecycleScope.launch {
             var finalStatus = "Серия остановлена"
             try {
-                finalStatus = runBurst(total, intervalSec, delaySec)
+                finalStatus = runBurst(total, intervalSec, delaySec, startAt, stopAt)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -121,6 +141,7 @@ class BurstService : LifecycleService() {
                 finalStatus = "Ошибка камеры: ${e.message ?: e.javaClass.simpleName}"
             } finally {
                 runCatching { cameraProvider?.unbindAll() }
+                camera = null
                 releaseWakeLock()
                 BurstStateHolder.update {
                     it.copy(isRunning = false, countdownSec = 0, phase = "", status = finalStatus)
@@ -131,13 +152,32 @@ class BurstService : LifecycleService() {
         }
     }
 
-    private suspend fun runBurst(total: Int, intervalSec: Int, delaySec: Int): String {
+    private suspend fun runBurst(
+        total: Int, intervalSec: Int, delaySec: Int, startAt: Long, stopAt: Long
+    ): String {
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val stopElapsed = if (stopAt > 0) nowElapsed + (stopAt - nowWall) else Long.MAX_VALUE
+
+        // 1. Ожидание времени старта (камера пока не занята)
+        if (startAt > nowWall) {
+            val startElapsed = nowElapsed + (startAt - nowWall)
+            if (startElapsed >= stopElapsed) return "Время старта позже времени остановки"
+            val msg = "Ожидание старта в ${hhmm(startAt)}"
+            BurstStateHolder.update { it.copy(status = msg) }
+            updateNotification(msg)
+            if (!waitUntil(startElapsed, "До старта", stopElapsed)) return "Остановлено по таймеру до начала съёмки"
+        }
+
+        // 2. Камера
         val provider = ProcessCameraProvider.getInstance(this).await()
         cameraProvider = provider
 
         val capture = buildImageCapture()
         provider.unbindAll()
-        provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture)
+        val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture)
+        camera = cam
+        applyControls(cam)
 
         val res = capture.resolutionInfo?.resolution
         val resText = if (res != null) {
@@ -146,9 +186,11 @@ class BurstService : LifecycleService() {
         BurstStateHolder.update { it.copy(resolution = resText, status = "Камера готова") }
         Log.i(TAG, "Разрешение снимка: $resText")
 
-        // Пауза до старта: за это время успевают сойтись экспозиция и фокус
-        waitUntil(SystemClock.elapsedRealtime() + delaySec * 1000L, "Старт через")
+        // 3. Пауза: сходится экспозиция (с учётом EV и зума)
+        if (!waitUntil(SystemClock.elapsedRealtime() + delaySec * 1000L, "Старт через", stopElapsed))
+            return "Остановлено по таймеру"
 
+        // 4. Серия
         val infinite = total <= 0
         val intervalMs = intervalSec * 1000L
         val t0 = SystemClock.elapsedRealtime()
@@ -169,14 +211,38 @@ class BurstService : LifecycleService() {
             updateNotification(msg)
 
             if (failStreak >= MAX_FAIL_STREAK) {
-                return "Остановлено: $MAX_FAIL_STREAK ошибки подряд (сохранено $ok)"
+                return "Остановлено: $MAX_FAIL_STREAK ошибок подряд (сохранено $ok)"
             }
             if (!infinite && n >= total) break
 
-            // Период считается от t0, а не «пауза после кадра»: время записи не накапливается
-            waitUntil(t0 + n * intervalMs, "Следующий кадр через")
+            if (!waitUntil(t0 + n * intervalMs, "Следующий кадр через", stopElapsed)) {
+                return "Остановлено по таймеру: сохранено $ok из $n"
+            }
         }
         return "Серия завершена: сохранено $ok из $n"
+    }
+
+    /** Применяет компенсацию экспозиции и цифровой зум к активной камере. */
+    private fun applyControls(cam: Camera) {
+        val info = cam.cameraInfo
+
+        val es = info.exposureState
+        val evText = if (es.isExposureCompensationSupported) {
+            var step = es.exposureCompensationStep.toFloat()
+            if (step <= 0f) step = 1f
+            val range = es.exposureCompensationRange
+            val idx = (desiredEv / step).roundToInt().coerceIn(range.lower, range.upper)
+            cam.cameraControl.setExposureCompensationIndex(idx)
+            String.format(Locale.US, "EV %+.1f", idx * step)
+        } else "EV: не поддерживается"
+
+        val maxZoom = info.zoomState.value?.maxZoomRatio ?: desiredZoom
+        val zoom = desiredZoom.coerceIn(1f, maxOf(1f, maxZoom))
+        cam.cameraControl.setZoomRatio(zoom)
+
+        val text = String.format(Locale.US, "%s, зум %.0f×", evText, zoom)
+        BurstStateHolder.update { it.copy(controls = text) }
+        Log.i(TAG, "Применено: $text")
     }
 
     private fun buildImageCapture(): ImageCapture {
@@ -185,7 +251,6 @@ class BurstService : LifecycleService() {
             .setResolutionStrategy(
                 ResolutionStrategy(TARGET_SIZE, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
             )
-            // Страховка: даже если камера предложит 50 МП, берём только размеры до ~13 МП
             .setResolutionFilter(ResolutionFilter { sizes, _ ->
                 val limited = sizes.filter { it.width.toLong() * it.height <= MAX_PIXELS }
                 if (limited.isEmpty()) sizes else limited
@@ -199,16 +264,23 @@ class BurstService : LifecycleService() {
             .build()
     }
 
-    /** Ждёт до момента target, обновляя обратный отсчёт. */
-    private suspend fun waitUntil(target: Long, phase: String) {
+    /**
+     * Ждёт до target (elapsedRealtime), но не дольше stopElapsed.
+     * Возвращает true, если дождались target; false, если раньше наступило время остановки.
+     */
+    private suspend fun waitUntil(target: Long, phase: String, stopElapsed: Long): Boolean {
+        val reachedTarget = target < stopElapsed
+        val until = if (reachedTarget) target else stopElapsed
         while (true) {
-            val left = target - SystemClock.elapsedRealtime()
+            val left = until - SystemClock.elapsedRealtime()
             if (left <= 0) break
             val sec = ((left + 999) / 1000).toInt()
             BurstStateHolder.update { it.copy(countdownSec = sec, phase = phase) }
-            delay(minOf(left, 250L))
+            // Редкие пробуждения при длинном ожидании, частые перед самым кадром
+            delay(minOf(left, if (left > 5_000) 1000L else 250L))
         }
         BurstStateHolder.update { it.copy(countdownSec = 0, phase = "") }
+        return reachedTarget
     }
 
     private suspend fun takePhoto(capture: ImageCapture, index: Int): Boolean =
@@ -245,6 +317,9 @@ class BurstService : LifecycleService() {
                 if (cont.isActive) cont.resume(false)
             }
         }
+
+    private fun hhmm(ms: Long): String =
+        SimpleDateFormat("HH:mm", Locale.US).format(Date(ms))
 
     // ---- WakeLock и уведомление -------------------------------------------
 
