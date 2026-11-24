@@ -13,6 +13,7 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -112,7 +113,7 @@ class BurstService : LifecycleService() {
                 if (burstJob?.isActive == true) {
                     desiredEv = intent.getFloatExtra(EXTRA_EV, desiredEv)
                     desiredZoom = intent.getFloatExtra(EXTRA_ZOOM, desiredZoom)
-                    camera?.let { applyControls(it) }
+                    camera?.let { cam -> lifecycleScope.launch { applyControls(cam) } }
                 } else stopSelf()
             }
             ACTION_STOP -> {
@@ -222,27 +223,52 @@ class BurstService : LifecycleService() {
         return "Серия завершена: сохранено $ok из $n"
     }
 
-    /** Применяет компенсацию экспозиции и цифровой зум к активной камере. */
-    private fun applyControls(cam: Camera) {
-        val info = cam.cameraInfo
+    /**
+     * Применяет компенсацию экспозиции и цифровой зум.
+     *
+     * Камера открывается не мгновенно. Пока она не активна, CameraX отклоняет команды
+     * (OperationCanceledException), поэтому повторяем попытки и ждём подтверждения.
+     * В статусе показываются РЕАЛЬНЫЕ значения, считанные обратно из камеры.
+     */
+    private suspend fun applyControls(cam: Camera) {
+        var lastError = ""
+        repeat(20) {
+            try {
+                val info = cam.cameraInfo
 
-        val es = info.exposureState
-        val evText = if (es.isExposureCompensationSupported) {
-            var step = es.exposureCompensationStep.toFloat()
-            if (step <= 0f) step = 1f
-            val range = es.exposureCompensationRange
-            val idx = (desiredEv / step).roundToInt().coerceIn(range.lower, range.upper)
-            cam.cameraControl.setExposureCompensationIndex(idx)
-            String.format(Locale.US, "EV %+.1f", idx * step)
-        } else "EV: не поддерживается"
+                val es = info.exposureState
+                var evText = "EV: не поддерживается"
+                if (es.isExposureCompensationSupported) {
+                    var step = es.exposureCompensationStep.toFloat()
+                    if (step <= 0f) step = 1f
+                    val range = es.exposureCompensationRange
+                    val idx = (desiredEv / step).roundToInt().coerceIn(range.lower, range.upper)
+                    cam.cameraControl.setExposureCompensationIndex(idx).await()
+                    val real = info.exposureState.exposureCompensationIndex
+                    evText = String.format(Locale.US, "EV %+.1f", real * step)
+                }
 
-        val maxZoom = info.zoomState.value?.maxZoomRatio ?: desiredZoom
-        val zoom = desiredZoom.coerceIn(1f, maxOf(1f, maxZoom))
-        cam.cameraControl.setZoomRatio(zoom)
+                val maxZoom = info.zoomState.value?.maxZoomRatio ?: desiredZoom
+                val wanted = desiredZoom.coerceIn(1f, maxOf(1f, maxZoom))
+                cam.cameraControl.setZoomRatio(wanted).await()
+                val realZoom = info.zoomState.value?.zoomRatio ?: wanted
 
-        val text = String.format(Locale.US, "%s, зум %.0f×", evText, zoom)
-        BurstStateHolder.update { it.copy(controls = text) }
-        Log.i(TAG, "Применено: $text")
+                val text = String.format(Locale.US, "%s, зум %.1f×", evText, realZoom)
+                BurstStateHolder.update { it.copy(controls = text) }
+                Log.i(TAG, "Применено: $text")
+                return
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: CameraControl.OperationCanceledException) {
+                lastError = "камера ещё не активна"
+                delay(300)
+            } catch (e: Exception) {
+                lastError = e.message ?: e.javaClass.simpleName
+                delay(300)
+            }
+        }
+        Log.w(TAG, "EV/зум не применились: $lastError")
+        BurstStateHolder.update { it.copy(controls = "НЕ ПРИМЕНЕНО ($lastError)") }
     }
 
     private fun buildImageCapture(): ImageCapture {
