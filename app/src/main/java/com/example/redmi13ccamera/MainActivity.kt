@@ -9,7 +9,8 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -37,7 +38,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var etStopTime: EditText
     private lateinit var sbEv: SeekBar
     private lateinit var tvEv: TextView
-    private lateinit var cbZoom: CheckBox
+    private lateinit var rgZoom: RadioGroup
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var tvStatus: TextView
@@ -87,7 +88,7 @@ class MainActivity : ComponentActivity() {
             .putExtra(BurstService.EXTRA_INTERVAL, readInt(etInterval, 2, 1, 3600))
             .putExtra(BurstService.EXTRA_DELAY, readInt(etDelay, 3, 0, 600))
             .putExtra(BurstService.EXTRA_EV, evValue(sbEv.progress))
-            .putExtra(BurstService.EXTRA_ZOOM, if (cbZoom.isChecked) 2f else 1f)
+            .putExtra(BurstService.EXTRA_ZOOM, zoomValue())
             .putExtra(BurstService.EXTRA_START_AT, startAt)
             .putExtra(BurstService.EXTRA_STOP_AT, stopAt)
         // Foreground-сервис с камерой можно запускать только пока приложение на экране
@@ -101,8 +102,14 @@ class MainActivity : ComponentActivity() {
             Intent(this, BurstService::class.java)
                 .setAction(BurstService.ACTION_UPDATE)
                 .putExtra(BurstService.EXTRA_EV, evValue(sbEv.progress))
-                .putExtra(BurstService.EXTRA_ZOOM, if (cbZoom.isChecked) 2f else 1f)
+                .putExtra(BurstService.EXTRA_ZOOM, zoomValue())
         )
+    }
+
+    /** Выбранный уровень цифрового увеличения: 1; 1,5; 2; 2,5. */
+    private fun zoomValue(): Float {
+        val rb = rgZoom.findViewById<RadioButton>(rgZoom.checkedRadioButtonId)
+        return (rb?.tag as? Float) ?: 1f
     }
 
     private fun onStopClicked() {
@@ -268,11 +275,19 @@ class MainActivity : ComponentActivity() {
         })
 
         // --- Зум ---
-        cbZoom = CheckBox(this).apply {
-            text = "Цифровое увеличение 2×"
-            setOnCheckedChangeListener { _, _ -> sendLiveUpdate() }
+        col.addView(label("Цифровое увеличение"))
+        rgZoom = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        listOf("1×" to 1f, "1,5×" to 1.5f, "2×" to 2f, "2,5×" to 2.5f).forEach { (name, value) ->
+            val rb = RadioButton(this).apply {
+                text = name
+                tag = value
+                id = View.generateViewId()
+            }
+            rgZoom.addView(rb, RadioGroup.LayoutParams(0, RadioGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
-        col.addView(cbZoom, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        rgZoom.check(rgZoom.getChildAt(0).id)
+        rgZoom.setOnCheckedChangeListener { _, _ -> sendLiveUpdate() }
+        col.addView(rgZoom)
 
         btnStart = Button(this).apply {
             text = "Старт"
